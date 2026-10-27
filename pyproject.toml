@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmresfi"
+version = "0.1.0"
+description = "LLMResFI: a fault injection framework for LLM training and inference resilience studies"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LLMResFI contributors" }]
+keywords = ["fault-injection", "llm", "reliability", "pytorch", "soft-error", "bit-flip"]
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+datasets = ["datasets>=2.14", "accelerate>=0.20"]
+
+[tool.setuptools.packages.find]
+include = ["llmresfi*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

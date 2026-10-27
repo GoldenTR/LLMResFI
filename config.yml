@@ -1,0 +1,56 @@
+# LLMResFI default configuration (YAML)
+# For a full field reference see README.md.
+
+run_mode: inference        # inference | training
+
+###########################
+# 1. Model & runtime      #
+###########################
+model:
+  repo: "microsoft/Phi-3.5-mini-instruct"   # any HuggingFace identifier or local path
+  dtype: "float16"                          # float16 | bfloat16 | float32
+  device: "cuda"                            # cuda | cpu | auto
+
+###########################
+# 2. Distributed          #
+###########################
+distributed:
+  backend: "none"          # none | ddp | fsdp
+  world_size: 1
+  inject_rank: null        # which rank to inject (null = all ranks)
+
+###########################
+# 3. Fault specification  #
+###########################
+fault:
+  target: "weight"         # weight|activation|kv_cache|loss|gradient|optimizer|master_weight|comm
+  locate: "random"         # random | manual
+  layer_idx: null          # used when locate == manual
+  module_regex: ".*"       # used when locate == manual; regex to pick submodule in the layer
+
+  stage:                   # when to inject (depends on run_mode)
+    type: "prefill"        # inference: prefill|first_token|decode ; training: forward|backward|optimizer_step|comm
+    token_step: null       # only meaningful for decode; integer or null
+
+  fault_model:             # what fault to inject
+    type: "single"         # single|double|multi|sign|exponent|mantissa|random
+                           # |random_value|zero|nan|inf|scale|stuck_at_0|stuck_at_1
+    bit_idx: null          # optional manual bit index (for stuck_at)
+    min_val: -1.0          # for random_value
+    max_val: 1.0           # for random_value
+    factor: 2.0            # for scale
+
+  timing:                  # how long the fault persists
+    type: "transient"      # transient | permanent | intermittent
+    steps: 1               # permanent: number of steps to persist
+    period: 1              # intermittent: inject every `period` triggers
+
+###########################
+# 4. Execution control    #
+###########################
+execution:
+  random_seed: 42
+  one_fault_per_run: true
+  log_dir: "./runs/exp1"
+  save_text: true
+  verbosity: 1             # 0 = minimal, 1 = progress, 2 = debug
