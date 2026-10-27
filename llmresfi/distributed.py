@@ -59,7 +59,10 @@ class DDPCommInjector(CommInjector):
             flat_idx = self.injector.rng.randrange(tensor.numel())
             bits = flip_flat(tensor, flat_idx, self.cfg.fault.fault_model, self.injector.rng)
             self.injector.record = self.injector._make_record(
-                "comm", None, "ddp", flat_idx=flat_idx, bit_idxs=bits, backend="ddp"
+                "comm",
+                backend="ddp",
+                flat_idx=flat_idx,
+                bit_idxs=bits,
             )
         return dist.all_reduce(tensor, async_op=True).get_future()
 

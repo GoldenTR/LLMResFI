@@ -152,8 +152,8 @@ class FaultInjector:
             self._weight_backup = (module, (row, col), orig)
             self.record = self._make_record(
                 "weight",
-                layer_idx,
-                mod_info.name,
+                layer_idx=layer_idx,
+                module_path=mod_info.name,
                 row=row,
                 col=col,
                 bit_idxs=bits,
@@ -179,7 +179,11 @@ class FaultInjector:
             flat_idx = self.rng.randrange(tensor.numel())
             bits = flip_flat(tensor, flat_idx, self.cfg.fault.fault_model, self.rng)
             self.record = self._make_record(
-                "activation", layer_idx, mod_info.name, flat_idx=flat_idx, bit_idxs=bits
+                "activation",
+                layer_idx=layer_idx,
+                module_path=mod_info.name,
+                flat_idx=flat_idx,
+                bit_idxs=bits,
             )
             return output
 
@@ -203,8 +207,8 @@ class FaultInjector:
             bits = flip_flat(tensor, flat_idx, self.cfg.fault.fault_model, self.rng)
             self.record = self._make_record(
                 "kv_cache",
-                layer_idx,
-                attn_mod.__class__.__name__,
+                layer_idx=layer_idx,
+                module_path=attn_mod.__class__.__name__,
                 flat_idx=flat_idx,
                 bit_idxs=bits,
                 kv="K" if tensor is K else "V",
@@ -223,7 +227,7 @@ class FaultInjector:
             return None
         flat_idx = self.rng.randrange(loss.numel())
         bits = flip_flat(loss, flat_idx, self.cfg.fault.fault_model, self.rng)
-        self.record = self._make_record("loss", None, None, flat_idx=flat_idx, bit_idxs=bits)
+        self.record = self._make_record("loss", flat_idx=flat_idx, bit_idxs=bits)
         return self.record
 
     # ------------------------------------------------------------------
@@ -239,7 +243,10 @@ class FaultInjector:
             flat_idx = self.rng.randrange(grad.numel())
             bits = flip_flat(grad, flat_idx, self.cfg.fault.fault_model, self.rng)
             self.record = self._make_record(
-                "gradient", None, param_info.name, flat_idx=flat_idx, bit_idxs=bits
+                "gradient",
+                param_path=param_info.name,
+                flat_idx=flat_idx,
+                bit_idxs=bits,
             )
             return grad
 
@@ -275,7 +282,11 @@ class FaultInjector:
         flat_idx = self.rng.randrange(tensor.numel())
         bits = flip_flat(tensor, flat_idx, self.cfg.fault.fault_model, self.rng)
         self.record = self._make_record(
-            "optimizer", None, param_path, flat_idx=flat_idx, bit_idxs=bits, state_key=key
+            "optimizer",
+            param_path=param_path,
+            state_key=key,
+            flat_idx=flat_idx,
+            bit_idxs=bits,
         )
 
     # ------------------------------------------------------------------
@@ -293,7 +304,10 @@ class FaultInjector:
                 flat_idx = self.rng.randrange(p.data.numel())
                 bits = flip_flat(p.data, flat_idx, self.cfg.fault.fault_model, self.rng)
                 self.record = self._make_record(
-                    "master_weight", None, param_info.name, flat_idx=flat_idx, bit_idxs=bits
+                    "master_weight",
+                    param_path=param_info.name,
+                    flat_idx=flat_idx,
+                    bit_idxs=bits,
                 )
             return original_step(*args, **kwargs)
 
@@ -316,11 +330,9 @@ class FaultInjector:
     # ------------------------------------------------------------------
     # record helper
     # ------------------------------------------------------------------
-    def _make_record(self, target, layer_idx, module_path, **extra) -> dict:
+    def _make_record(self, target, **extra) -> dict:
         rec = {
             "target": target,
-            "layer_idx": layer_idx,
-            "module_path": module_path,
             "fault_model": self.cfg.fault.fault_model.type,
             "timing": self.cfg.fault.timing.type,
             "stage": self.tracker.stage,

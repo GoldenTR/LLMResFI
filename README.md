@@ -82,6 +82,27 @@ python examples/run_training.py --target loss --stage backward
 python examples/run_training.py --target master_weight --stage optimizer_step
 ```
 
+Example output (gradient injection):
+
+```text
+[step 0] loss=2.3141 stage=forward
+[step 1] loss=2.2390 stage=forward
+[step 2] loss=2.1681 stage=forward
+[step 3] loss=2.1005 stage=forward
+[step 4] loss=2.0349 stage=forward
+
+Injection record:
+  target: gradient
+  param_path: net.4.bias        # parameter targeted (layer_idx is None for param targets)
+  fault_model: single
+  timing: transient
+  stage: backward               # injected during the backward pass of step 0
+  step: 0
+  token_step: -1
+  flat_idx: 1
+  bit_idxs: [1]                 # bit 1 flipped in element 1 of the bias tensor
+```
+
 ### 3. Distributed (DDP)
 
 ```bash
