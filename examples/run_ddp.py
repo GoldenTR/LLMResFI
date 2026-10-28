@@ -66,6 +66,17 @@ def main():
     ap.add_argument("--inject_rank", type=int, default=0)
     args = ap.parse_args()
 
+    if "RANK" not in os.environ and "WORLD_SIZE" not in os.environ:
+        raise SystemExit(
+            "This example must be launched via `torchrun`, which sets the "
+            "RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT environment variables.\n"
+            "Run:\n"
+            "  torchrun --nproc_per_node=2 examples/run_ddp.py --target comm --stage backward\n"
+            "Note: on Windows CPU-only torch builds, torchrun's rendezvous store may "
+            "fail (PyTorch built without libuv); on such machines launch the ranks "
+            "manually with init_method=tcp://... instead."
+        )
+
     dist.init_process_group(backend="gloo")
     rank = dist.get_rank()
 

@@ -9,7 +9,8 @@ run_mode: inference        # inference | training
 model:
   repo: "microsoft/Phi-3.5-mini-instruct"   # any HuggingFace identifier or local path
   dtype: "float16"                          # float16 | bfloat16 | float32
-  device: "cuda"                            # cuda | cpu | auto
+  device: "cuda"                            # cuda | cpu | auto (auto needs `accelerate`)
+  trust_remote_code: false                  # set true only for models that require custom code
 
 ###########################
 # 2. Distributed          #

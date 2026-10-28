@@ -22,12 +22,16 @@ from llmresfi import FIConfig, FaultInjector, ModelInspector, StageTracker
 
 
 def load_model(cfg: FIConfig):
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model.repo,
-        trust_remote_code=True,
-        torch_dtype=getattr(torch, cfg.model.dtype),
-        device_map=cfg.model.device if cfg.model.device != "auto" else "auto",
-    )
+    kwargs = {"torch_dtype": getattr(torch, cfg.model.dtype)}
+    if cfg.model.trust_remote_code:
+        kwargs["trust_remote_code"] = True
+    if cfg.model.device == "auto":
+        kwargs["device_map"] = "auto"
+
+    model = AutoModelForCausalLM.from_pretrained(cfg.model.repo, **kwargs)
+    if cfg.model.device in ("cuda", "cpu"):
+        model = model.to(cfg.model.device)
+
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.repo)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token if tokenizer.eos_token_id is not None else "[PAD]"

@@ -14,6 +14,7 @@ class ModelCfg(BaseModel):
     repo: str
     dtype: Literal["float16", "bfloat16", "float32"] = "float16"
     device: Literal["cuda", "cpu", "auto"] = "cuda"
+    trust_remote_code: bool = False
 
 
 # ---------------- distributed ----------------
