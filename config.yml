@@ -18,7 +18,15 @@ model:
 distributed:
   backend: "none"          # none | ddp | fsdp
   world_size: 1
-  inject_rank: null        # which rank to inject (null = all ranks)
+  inject_rank: null        # single rank to inject (null = use the fields below)
+  inject_ranks: null       # explicit subset, e.g. [0, 3]
+  inject_rank_fraction: 1.0  # deterministic random subset when no explicit rank; 1.0 = all
+  injection_point: "before_reduce"  # before_reduce | after_reduce
+  bucket_index: null       # target one gradient bucket per backward (null = any)
+  fsdp_injection: "grad_shard"  # legacy FSDP (<2.0): param_shard | grad_shard | both
+  divide_by_world_size: true  # DDP/FSDP gradient averaging (keep true for normal training)
+  verify_comm: false       # cheap checksum verification (extra collective per bucket)
+  verify_atol: 1.0e-6
 
 ###########################
 # 3. Fault specification  #
@@ -55,3 +63,24 @@ execution:
   log_dir: "./runs/exp1"
   save_text: true
   verbosity: 1             # 0 = minimal, 1 = progress, 2 = debug
+
+###########################
+# 5. Mitigation           #
+###########################
+mitigation:
+  enabled: false
+  detector:
+    non_finite: true
+    check_parameters: true
+    grad_norm_ratio: 5.0    # flag grad norm > ratio * EMA
+    loss_ratio: 3.0         # flag loss > ratio * EMA
+    warmup_steps: 5
+  recovery:
+    mode: "none"            # none | sanitize | step_rollback | checkpoint_rollback
+    max_retries: 1
+    sanitize: "zero"        # zero | clamp
+    clip_norm: null
+    snapshot_every: 1
+    checkpoint_every: 0     # 0 disables periodic checkpoints
+    checkpoint_dir: null    # default: <log_dir>/checkpoints
+    keep_checkpoints: 2

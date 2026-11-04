@@ -66,7 +66,9 @@ LLMResFI 是一个**模型层（application-level）**软错误故障注入工�
 ├─────────────────────────────────────────────────────────────┤
 │  Distributed Layer（DDP/FSDP 通信钩子）                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Analysis（结果分类 SDC/masked/DUE + 敏感性分析 + 收敛影响）    │
+│  Reporting（summary.json + 基线对比 + 敏感性/开销聚合）         │
+├─────────────────────────────────────────────────────────────┤
+│  Analysis（结果分类 SDC/masked/DUE + 收敛影响可视化）           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -162,7 +164,7 @@ class BitFlipper:
 | **Adam 动量/方差** | patch `optimizer.step()` 注入 `exp_avg`/`exp_avg_sq` | optimizer_step | **新增** |
 | **master weight(fp32)** | 混合精度下 fp32 副本注入 | optimizer_step | **新增** |
 | GradScaler scale | 注入 `loss_scale` | 任意 | 新增 |
-| **通信张量** | DDP/FSDP 通信钩子 | comm | **新增** |
+| **通信张量** | DDP all-reduce 钩子；FSDP reduce-scatter 钩子（torch≥2.0）或分片注入（torch 1.12） | comm | **新增** |
 
 ### 4.3 两模式共享机制
 
@@ -177,26 +179,81 @@ class BitFlipper:
 
 - 通过 `model.register_comm_hook` 拦截梯度桶（gradient bucket）。
 - 注入时机：
-  - **all-reduce 前**：单卡梯度局部翻转，导致各 rank 梯度不一致。
-  - **all-reduce 后**：翻转同步后的统一梯度。
-- 支持"不一致注入"（仅部分 rank 注入），研究数据并行下的错误传播差异。
+  - `before_reduce`：单卡梯度局部翻转，错误随后被平均进所有 rank（对称传播 / 静默污染）。
+  - `after_reduce`：只翻转选定 rank 的归约结果，该 rank 与其余 rank 静默发散（非对称 SDC）。
+- rank 选择：`inject_rank`（单 rank）、`inject_ranks`（显式集合）、
+  `inject_rank_fraction`（由 `random_seed` 确定性采样的子集）。
+- `bucket_index` 可定位到某一次 backward 中的特定梯度桶。
+- 钩子自行执行 `all_reduce` 并按 `world_size` 做平均
+  （PyTorch 文档要求自定义钩子负责该除法），避免 world size 改变训练语义。
+- 可选 `verify_comm`：归约前 all-gather 每个 rank 的
+  `(sum, sum|g|)` 检查量，归约后同时检查
+  (a) 归约一致性 与 (b) 各 rank 结果一致性。
 
 ```python
 def comm_hook(state, bucket):
-    # 在 all_reduce 前/后对 bucket 张量注入
     tensor = bucket.buffer()
-    inject(tensor)  # 可选 before/after
-    fut = torch.distributed.all_reduce(tensor, async_op=True)
-    return fut
+    if inject_before:
+        inject(tensor)
+    fut = dist.all_reduce(tensor, async_op=True).get_future()
+    def after(f):
+        f.wait()
+        tensor.div_(world_size)
+        if inject_after:
+            inject(tensor)
+        if verify:
+            check_checksums(tensor)
+        return tensor
+    return fut.then(after)
 ```
 
 ### 5.2 FSDP（ZeRO 分片）
 
-- 钩子点：`post_backward_hook`（梯度归约后）、`reshard`（分片回传）、`gather`（前向参数聚合）。
-- 注入对象：分片参数、聚合后的 full param、梯度 shard。
-- 目标：研究 ZeRO 分片/重分片过程中的数据损坏影响。
+- **PyTorch ≥ 2.0**：通过 `FSDP.register_comm_hook` 拦截归约前的完整
+  unsharded 梯度；钩子执行 `reduce_scatter_tensor`（`NO_SHARD` 时
+  `all_reduce`）并按 world size 做除法。支持 `before_reduce` /
+  `after_reduce`，记录 `sharded=True`。
+- **PyTorch 1.12**（无 FSDP comm hook）：降级为分片级注入：
+  - `param_shard`：forward pre-hook 中翻转本地 `flat_param` 分片，随后被
+    all-gather 到完整参数（模拟参数分片软错误）。
+  - `grad_shard`：在 `optimizer.step` 前由
+    `injector.inject_distributed_now()` 翻转本地 sharded gradient
+    （模拟 reduce-scatter 后的梯度分片软错误）。
+  - 记录 `legacy_fsdp=True`，明确区分于完整梯度注入。
+- 显式步前注入保证检测/回滚发生在优化器更新之前。
 
-### 5.3 可扩展性
+### 5.3 通信校验与可观测性
+
+- 校验和采用线性量 `sum(g)`；`sum|g|` 仅作为尺度估计，不能直接做等值比较
+  （绝对值不满足线性）。
+- `after_reduce` 的单 bit 翻转远低于 float32 归约噪声，但会被
+  **跨 rank 一致性**检查精确捕获。
+- `before_reduce` 的单 bit 翻转可能淹没在 float32 累加误差中；这是单次
+  all-reduce 的观测极限，需要冗余（重算、复制桶或独立二次归约）才能严格检出。
+- 每个故障记录包含：`rank`、`world_size`、`bucket_index`、`bucket_numel`、
+  `dtype`、`flat_idx`、`bit_idxs`、`injection_point`、`backend`、
+  `legacy_fsdp`。
+
+### 5.4 检测与恢复
+
+- **检测**：
+  - 非有限梯度/参数（NaN/Inf）；
+  - 梯度范数相对 EMA 的突增；
+  - loss 相对 EMA 的突增或非有限；
+  - DDP 校验和不一致。
+- 所有 rank 通过一次 MAX all-reduce 对“是否发生故障”达成一致，避免单 rank
+  回滚造成 DDP/FSDP 死锁。
+- **恢复策略**：
+  - `sanitize`：将非有限梯度置零并可做全局裁剪（低开销，非无损）；
+  - `step_rollback`：步首保存参数/优化器/RNG 快照，故障时恢复并重放同一
+    batch（瞬态故障下可无损，代价是快照内存 + 故障步的一次额外前后向）；
+  - `checkpoint_rollback`：首次 `begin_step()` 自动保存初始检查点，之后按
+    `checkpoint_every` 保存；恢复最近磁盘检查点（最多丢失一个检查点间隔）。
+    恢复后必须把 tracker 与数据迭代器回退到 `checkpoint_step` 并重放之后的
+    所有 step；只恢复参数但继续当前 step 语义上不等价于无损恢复。
+- 事件写入 `<log_dir>/recovery.jsonl`，含触发信号、动作、重试次数。
+
+### 5.5 可扩展性
 
 - 通信钩子抽象为 `CommInjector` 接口，未来可扩展张量并行（TP）/流水线并行（PP）的通信张量注入。
 
@@ -211,14 +268,16 @@ def comm_hook(state, bucket):
 
 ### 6.2 传播追踪
 
-- 记录注入点（step, stage, layer, tensor type, bit position）。
-- 追踪下游指标：loss 曲线、梯度范数、最终准确率、PPL 变化。
+- 记录注入点（step, stage, rank, bucket, tensor type, bit position），
+  支持跨 rank `all_gather` 汇总（`distributed.gather_records`）。
+- 追踪下游指标：loss 曲线、梯度范数、最终准确率、PPL 变化；
+  `distributed.all_gather_metrics` 提供每 rank 的 loss / grad norm。
 - 输出故障→结果的因果链，支持"某 bit 位置/层/阶段"的敏感性排序。
 
 ### 6.3 可复现
 
-- `random_seed` 统一控制：目标选择、bit 选择、时序选择。
-- 训练：step 级 checkpoint 重放，注入前后状态可复现。
+- `random_seed` 统一控制：目标选择、bit 选择、时序选择、rank 子集选择。
+- 训练：步级参数/优化器/RNG 快照重放；注入前后状态可复现。
 - 推理：贪心解码（argmax）保证确定性（沿用 LLMFI）。
 
 ---
@@ -227,12 +286,21 @@ def comm_hook(state, bucket):
 
 ### 7.1 结果分类（借鉴 NVBitFI，适配 LLM）
 
-| 类别 | 说明 |
-|---|---|
-| Masked | 故障被覆盖（写入前被读/未读取） |
-| DUE | 可检测错误（NaN 崩溃、loss 爆炸、assert 失败、超时） |
-| SDC | 静默数据损坏（输出错误但程序正常结束） |
-| Detected | 通过 ECC/检查机制显式报错 |
+`reporting.classify_summary` 同时使用检测/恢复记录和同配置基线做分类。基线按
+backend、model、device、world size、seed、steps 匹配；没有基线时只能给出
+detected / undetected。
+
+| 类别 | 判定 | 说明 |
+|---|---|---|
+| Baseline | 运行标记为 baseline | 无故障参考运行 |
+| No fault | 非 baseline 且无注入记录 | 检查 timing/stage/rank/bucket 配置，不应作为故障结果统计 |
+| Recovered | 检测 + 成功回滚 + loss/参数签名在容差内匹配基线 | 可称为“在给定容差内无损恢复” |
+| Mitigated | 检测 + 未回滚 + 无显著差异 | 典型为 sanitize；低开销但不保证严格无损 |
+| Detected, unrecovered | 检测到但最终状态仍偏离基线 | 恢复逻辑、checkpoint 重放或持续故障仍需排查 |
+| SDC | 未检测到但最终状态偏离基线 | 静默数据损坏，是最需要关注的可靠性失效 |
+| Masked | 未检测到且无可测偏离 | 可能命中无关元素、被数值误差吸收或被粗粒度指标掩盖 |
+| DUE | 检测后 abort | 重试耗尽、无快照/检查点等可检测错误 |
+| Detected / Undetected | 无匹配基线时的降级分类 | 只能评估可观测性，不能确认是否发生 SDC |
 
 ### 7.2 任务指标
 
@@ -243,6 +311,22 @@ def comm_hook(state, bucket):
 
 - bit 位置（sign vs exponent vs mantissa）→ 故障影响排序。
 - 层敏感性（浅层 vs 深层）、阶段敏感性（forward vs backward vs optimizer）。
+
+### 7.4 实验产物与聚合分析
+
+- `run_ddp.py` / `run_fsdp.py` 在每个运行目录写 `summary.json`，包含 resolved
+  config、所有 rank 的注入记录、loss 曲线、每步耗时、峰值显存、恢复事件、
+  最终梯度/参数签名和近似参数指纹。
+- `examples/analyze_runs.py --root <campaign_dir>` 聚合所有 summary，输出
+  `recovered` / `mitigated` / `SDC` / `masked` / `DUE` 计数与比例，并按
+  fault model、injection point、bit region、rank、bucket、timing、mitigation
+  分组；同时输出相对基线的 step-time / peak-memory 开销。
+- `summary.json` 中的参数指纹由 signed sum、absolute sum、L2、位置加权和、
+  max-abs 组成，采用分块 float64 计算以限制额外内存。它是紧凑的近似比较，
+  不能替代完整 state-dict 的逐元素或逐比特对照。需要严格“无损”结论时，应
+  保存最终 state dict 或使用独立参考模型做精确比较。
+- 同一实验目录只能保存一个 summary；baseline 与各故障配置应使用不同
+  `--log_dir`，分析时放在同一 campaign 根目录下。
 
 ---
 
@@ -261,6 +345,13 @@ model:
 distributed:
   backend: "fsdp"             # none | ddp | fsdp
   world_size: 4
+  inject_rank: 0              # single rank (null = use the fields below)
+  inject_ranks: null          # explicit subset, e.g. [0, 2]
+  inject_rank_fraction: 1.0   # deterministic random subset; 1.0 = all ranks
+  injection_point: "before_reduce"  # before_reduce | after_reduce
+  bucket_index: null          # target one bucket per backward
+  fsdp_injection: "grad_shard"  # torch 1.12 fallback: param_shard | grad_shard | both
+  verify_comm: false          # checksum guard (DDP)
 
 fault:
   target: "gradient"          # weight|activation|kv_cache|loss|gradient|optimizer|master_weight|comm
@@ -280,21 +371,51 @@ execution:
   random_seed: 42
   log_dir: "./runs/exp1"
   one_fault_per_run: true
+
+mitigation:
+  enabled: true
+  detector:
+    non_finite: true
+    check_parameters: true
+    grad_norm_ratio: 5.0
+    loss_ratio: 3.0
+    warmup_steps: 5
+  recovery:
+    mode: "step_rollback"     # none | sanitize | step_rollback | checkpoint_rollback
+    max_retries: 1
+    sanitize: "zero"          # zero | clamp
+    clip_norm: null
+    snapshot_every: 1
+    checkpoint_every: 0
+    checkpoint_dir: null
+    keep_checkpoints: 2
 ```
 
 ### 8.2 Python API（统一入口）
 
 ```python
-from llmresfi import FaultInjector, ModelInspector, StageTracker, FIConfig
+from llmresfi import (
+    FIConfig, FaultInjector, ModelInspector, RecoveryManager, StageTracker,
+)
 
 cfg = FIConfig.load("config.yml")
-inspector = ModelInspector(model)          # 发现层/参数/buffer/优化器状态
-tracker = StageTracker(cfg.run_mode)       # 推理/训练阶段跟踪
-injector = FaultInjector(cfg, inspector, tracker, rng)
+inspector = ModelInspector(model, optimizer)
+tracker = StageTracker(cfg.run_mode)
+injector = FaultInjector(cfg, inspector, tracker, rng, optimizer)
+recovery = RecoveryManager(cfg, model, optimizer, tracker)
 
-injector.arm()      # 注册 hook / 补丁 / 通信钩子
-# ... 运行训练或推理 ...
-injector.disarm()   # 移除 hook + 恢复权重
+injector.arm(ddp_model)     # comm 目标必须传入 DDP/FSDP 包装后的模型
+recovery.begin_step()
+# ... forward / backward ...
+injector.inject_distributed_now()   # torch 1.12 FSDP 需要；DDP 为 no-op
+signals = recovery.check(loss, injector=injector)
+action = recovery.decide(signals)    # continue / retry_step / abort
+if action == "retry_step":
+    tracker.on_retry()
+    # 重放同一 batch
+optimizer.step()
+recovery.end_step(loss, clean=not signals)
+injector.disarm()
 ```
 
 ---
@@ -305,8 +426,9 @@ injector.disarm()   # 移除 hook + 恢复权重
 |---|---|---|
 | **Phase 1** | 单卡推理：对齐并超越 LLMFI（真位翻转 + sign/exp/man 定向 + 时序） | 推理完整可用 |
 | **Phase 2** | 单卡训练：梯度/优化器/混合精度/损失注入 | 训练完整可用 |
-| **Phase 3** | 分布式：DDP + FSDP 通信钩子 | 多卡训练可用 |
-| **Phase 4** | 时序传播建模 + Campaign 编排 + 敏感性分析报告 | 完整工具发布 |
+| **Phase 3** | 分布式：DDP 前后归约注入 + rank/bucket 策略 + 校验和；FSDP comm hook + torch 1.12 分片降级 | **v0.2 已完成，多卡可用** |
+| **Phase 4** | 检测/清洗/步级回滚/检查点回滚 + 每 rank 指标 | **v0.2 部分完成** |
+| **Phase 5** | 时序传播建模 + Campaign 编排 + 敏感性分析报告 | 完整工具发布 |
 
 ---
 

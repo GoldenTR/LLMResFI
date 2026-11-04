@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmresfi"
-version = "0.1.0"
+version = "0.2.0"
 description = "LLMResFI: a fault injection framework for LLM training and inference resilience studies"
 readme = "README.md"
 requires-python = ">=3.9"

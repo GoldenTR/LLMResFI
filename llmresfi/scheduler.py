@@ -52,6 +52,14 @@ class StageTracker:
         self.stage = "forward"
         self.step += 1
 
+    def on_retry(self) -> None:
+        """Rewind the stage after a step-level rollback (step is unchanged)."""
+        if self.run_mode == "training":
+            self.stage = "forward"
+        else:
+            self.stage = "prefill"
+            self.token_step = -1
+
     # ---------------- helpers ----------------
     def matches(self, spec_stage: str, token_step=None) -> bool:
         if spec_stage != self.stage:

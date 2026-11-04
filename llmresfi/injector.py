@@ -58,12 +58,22 @@ class FaultInjector:
         self._weight_fired = False
         self._original_step = None
         self._timing = TimingGate(cfg.fault.timing)
+        self._model = None
         self.record: Optional[dict] = None
+        self.records: List[dict] = []
+        self.comm_signals: List[dict] = []
 
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
-    def arm(self):
+    def arm(self, model=None):
+        """Register hooks.
+
+        ``model`` should be the *wrapped* module for distributed comm targets
+        (the ``DistributedDataParallel`` or FSDP root).  For non-comm targets
+        the inspector's underlying model is used when ``model`` is omitted.
+        """
+        self._model = model if model is not None else self.insp.model
         target = self.cfg.fault.target
         if target == "weight":
             self._arm_weight()
@@ -105,9 +115,35 @@ class FaultInjector:
         s = self.cfg.fault.stage
         return self.tracker.matches(s.type, s.token_step)
 
+    def _comm_phase_ok(self) -> bool:
+        """Comm collectives run inside backward for both DDP and FSDP.
+
+        A configured ``stage: comm`` is therefore treated as matching the
+        backward phase, while ``stage: backward`` also works unchanged.
+        """
+        s = self.cfg.fault.stage
+        if s.type == "comm":
+            return self.tracker.stage in ("backward", "comm")
+        return self.tracker.matches(s.type, s.token_step)
+
+    def _time_step(self):
+        if self.tracker.run_mode == "training":
+            return self.tracker.step
+        if self.tracker.stage == "decode":
+            return self.tracker.token_step
+        return None
+
     def _should_fire(self) -> bool:
-        if self._phase_ok() and self._timing.should_fire():
-            self._timing.mark_fired()
+        return self._should_fire_with_phase(self._phase_ok())
+
+    def _should_fire_comm(self) -> bool:
+        return self._should_fire_with_phase(self._comm_phase_ok())
+
+    def _should_fire_with_phase(self, phase_ok: bool) -> bool:
+        """Timing gate with a caller-provided phase predicate (distributed hooks)."""
+        step = self._time_step()
+        if phase_ok and self._timing.should_fire(step):
+            self._timing.mark_fired(step)
             return True
         return False
 
@@ -321,23 +357,54 @@ class FaultInjector:
         from .distributed import make_comm_injector
 
         self._comm_injector = make_comm_injector(self.cfg, self)
-        self._comm_injector.arm()
+        self._comm_injector.arm(self._model)
 
     def disarm_comm(self):
         if getattr(self, "_comm_injector", None) is not None:
             self._comm_injector.disarm()
 
+    def inject_distributed_now(self) -> None:
+        """Run non-collective distributed injections (legacy FSDP shard grads).
+
+        DDP and modern FSDP inject inside their collective hooks, so this is a
+        no-op for them.  Legacy FSDP (torch < 2.0) has no comm hook; call this
+        after backward and before ``optimizer.step``.
+        """
+        if getattr(self, "_comm_injector", None) is not None:
+            self._comm_injector.inject_now()
+
+    def add_comm_signal(self, signal: dict) -> None:
+        self.comm_signals.append(signal)
+
+    def drain_comm_signals(self) -> list:
+        signals, self.comm_signals = self.comm_signals, []
+        return signals
+
     # ------------------------------------------------------------------
     # record helper
     # ------------------------------------------------------------------
     def _make_record(self, target, **extra) -> dict:
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+            else:
+                rank, world_size = 0, 1
+        except Exception:
+            rank, world_size = 0, 1
         rec = {
             "target": target,
             "fault_model": self.cfg.fault.fault_model.type,
             "timing": self.cfg.fault.timing.type,
             "stage": self.tracker.stage,
+            "configured_stage": self.cfg.fault.stage.type,
             "step": self.tracker.step,
             "token_step": self.tracker.token_step,
+            "rank": rank,
+            "world_size": world_size,
         }
         rec.update(extra)
+        self.records.append(rec)
         return rec
