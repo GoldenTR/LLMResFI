@@ -1,6 +1,10 @@
+import random
+
+import pytest
 import torch
 
 from llmresfi.bitflip import BitFlipper
+from llmresfi.fault_models import apply_fault
 
 
 def test_layout_fp32():
@@ -36,3 +40,16 @@ def test_stuck_at_sign_bit():
     x = torch.tensor(1.0, dtype=torch.float32)
     y = BitFlipper.stuck_at(x, 31, 1)
     assert float(y.item()) == -1.0
+
+
+def test_apply_fault_honors_bit_idx():
+    x = torch.tensor(1.0, dtype=torch.float32)
+    y, bits = apply_fault(x, "exponent", random.Random(0), bit_idx=23)
+    assert bits == [23]
+    assert float(y.item()) == 0.5
+
+
+def test_apply_fault_rejects_bit_outside_region():
+    x = torch.tensor(1.0, dtype=torch.float32)
+    with pytest.raises(ValueError, match="not in the exponent region"):
+        apply_fault(x, "exponent", random.Random(0), bit_idx=0)

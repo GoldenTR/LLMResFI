@@ -7,7 +7,7 @@
 
 ## 0. 摘要
 
-LLMResFI 是一个**模型层（application-level）**软错误故障注入工具，统一覆盖 LLM 的**推理**与**训练**两大场景，并以**真 IEEE 位翻转**、**梯度/优化器状态故障**、**分布式通信故障**、**故障时序与传播建模**为核心创新点，区别于现有的 LLMFI、NVBitFI、PyTorchFI。
+LLMResFI 是一个**模型层（应用级）**软错误故障注入工具，统一覆盖 LLM 的**推理**与**训练**两大场景，并以**真实 IEEE 位翻转**、**梯度/优化器状态故障**、**分布式通信故障**、**故障时序与传播建模**为核心创新点，区别于现有的 LLMFI、NVBitFI、PyTorchFI。
 
 ---
 
@@ -26,16 +26,16 @@ LLMResFI 是一个**模型层（application-level）**软错误故障注入工�
 | 抽象层级 | 模型层 | 架构层（最低） | 模型层 | 模型层 |
 | 运行平台 | Python/HF | Linux + CUDA | Python/PyTorch | Python/PyTorch（跨平台） |
 
-**结论**：训练阶段的软错误注入（梯度、Adam 状态、混合精度 master weight、all-reduce 通信）是当前空白，也是 LLMResFI 最大的创新空间。
+**结论**：训练阶段的软错误注入（梯度、Adam 状态、混合精度主权重、全归约通信）是当前空白，也是 LLMResFI 最大的创新空间。
 
 ### 1.2 设计目标
 
 1. **训练 + 推理统一**：一套 API/配置，通过 `run_mode` + `stage` + `target` 三要素统一描述注入行为。
 2. **覆盖训练关键状态**：梯度、优化器状态、混合精度、通信张量。
 3. **支持分布式**：优先 DDP + FSDP，接口可扩展至张量/流水线并行。
-4. **丰富故障模型**：位翻转（sign/exponent/mantissa 定向）、值扰动、卡滞、时序类型。
+4. **丰富故障模型**：位翻转（符号/指数/尾数定向）、值扰动、卡滞、时序类型。
 5. **故障传播与时序建模**：持续性故障、步级传播、收敛影响分析。
-6. **可复现**：seed + checkpoint 重放 + 确定性解码。
+6. **可复现**：随机种子 + 检查点重放 + 确定性解码。
 
 ---
 
@@ -45,30 +45,30 @@ LLMResFI 是一个**模型层（application-level）**软错误故障注入工�
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│  Runner / Campaign（实验编排、checkpoint、seed 管理、并行执行） │
+│  运行器 / Campaign（实验编排、检查点、随机种子管理、并行执行）   │
 ├─────────────────────────────────────────────────────────────┤
-│  Config（YAML + pydantic 校验，LLMFI 风格）                    │
+│  配置（YAML + pydantic 校验，LLMFI 风格）                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Inspector（目标注册表：层/参数/buffer/优化器状态/通信桶发现）   │
+│  检查器（目标注册表：层/参数/缓冲区/优化器状态/通信桶发现）      │
 ├─────────────────────────────────────────────────────────────┤
-│  Scheduler（阶段 + 时序调度器）                               │
+│  调度器（阶段 + 时序调度）                                    │
 │        ├─ 阶段：prefill/first_token/decode（推理）           │
 │        └─       forward/backward/optimizer_step/comm（训练）  │
 │        └─ 时序：瞬态/永久/间歇                                │
 ├─────────────────────────────────────────────────────────────┤
-│  Injection Engine（故障模型库 + 真位翻转引擎）                 │
+│  注入引擎（故障模型库 + 真实位翻转引擎）                       │
 ├─────────────────────────────────────────────────────────────┤
-│  Hooks（注入执行层）                                          │
-│        ├─ 权重/激活/KV（forward hook）                       │
-│        ├─ 损失（loss tensor）                               │
-│        ├─ 梯度（autograd hook）                             │
+│  钩子层（注入执行）                                           │
+│        ├─ 权重/激活/KV（前向钩子）                           │
+│        ├─ 损失（loss 张量）                                  │
+│        ├─ 梯度（自动微分钩子）                               │
 │        └─ 优化器（optimizer.step 补丁）                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Distributed Layer（DDP/FSDP 通信钩子）                      │
+│  分布式层（DDP/FSDP 通信钩子）                               │
 ├─────────────────────────────────────────────────────────────┤
-│  Reporting（summary.json + 基线对比 + 敏感性/开销聚合）         │
+│  报告层（summary.json + 基线对比 + 敏感性/开销聚合）           │
 ├─────────────────────────────────────────────────────────────┤
-│  Analysis（结果分类 SDC/masked/DUE + 收敛影响可视化）           │
+│  分析层（结果分类 SDC/masked/DUE + 收敛影响可视化）            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,7 +82,7 @@ LLMResFI 是一个**模型层（application-level）**软错误故障注入工�
 Fault = { target_type, location, fault_model, timing, trigger_stage, bit_position? }
 ```
 
-### 3.1 位翻转（Bit Flip）
+### 3.1 位翻转
 
 | 类型 | 说明 |
 |---|---|
@@ -112,18 +112,18 @@ class BitFlipper:
         return iv.view(t.dtype)
 ```
 
-### 3.2 值扰动（Value Perturbation）
+### 3.2 值扰动
 
 - `random_value(min, max)`
 - `zero`（置零）
 - `nan` / `inf`（注入非有限值）
 - `scale(factor)`（乘性缩放）
 
-### 3.3 卡滞（Stuck-at）
+### 3.3 卡滞
 
 - `stuck_at_0` / `stuck_at_1`：将指定位强行置 0/1。
 
-### 3.4 时序类型（Timing）——核心创新之一
+### 3.4 时序类型——核心创新之一
 
 | 类型 | 语义 | 说明 |
 |---|---|---|
@@ -137,7 +137,7 @@ class BitFlipper:
 
 ### 4.1 推理注入点（`run_mode = inference`）
 
-**阶段调度**：`prefill → first_token → decode×N`（沿用 LLMFI 的 PhaseTracker 思路，作为 scheduler 的一等阶段）。
+**阶段调度**：`prefill → first_token → decode×N`（沿用 LLMFI 的阶段跟踪思路，作为调度器的一等阶段）。
 
 | 目标 | 注入机制 | 阶段 |
 |---|---|---|
@@ -210,14 +210,14 @@ def comm_hook(state, bucket):
 ### 5.2 FSDP（ZeRO 分片）
 
 - **PyTorch ≥ 2.0**：通过 `FSDP.register_comm_hook` 拦截归约前的完整
-  unsharded 梯度；钩子执行 `reduce_scatter_tensor`（`NO_SHARD` 时
+  未分片梯度；钩子执行 `reduce_scatter_tensor`（`NO_SHARD` 时
   `all_reduce`）并按 world size 做除法。支持 `before_reduce` /
   `after_reduce`，记录 `sharded=True`。
 - **PyTorch 1.12**（无 FSDP comm hook）：降级为分片级注入：
-  - `param_shard`：forward pre-hook 中翻转本地 `flat_param` 分片，随后被
+  - `param_shard`：在前向前置钩子中翻转本地 `flat_param` 分片，随后被
     all-gather 到完整参数（模拟参数分片软错误）。
   - `grad_shard`：在 `optimizer.step` 前由
-    `injector.inject_distributed_now()` 翻转本地 sharded gradient
+    `injector.inject_distributed_now()` 翻转本地分片梯度
     （模拟 reduce-scatter 后的梯度分片软错误）。
   - 记录 `legacy_fsdp=True`，明确区分于完整梯度注入。
 - 显式步前注入保证检测/回滚发生在优化器更新之前。
@@ -268,7 +268,7 @@ def comm_hook(state, bucket):
 
 ### 6.2 传播追踪
 
-- 记录注入点（step, stage, rank, bucket, tensor type, bit position），
+- 记录注入点（step、stage、rank、bucket、张量类型、bit 位置），
   支持跨 rank `all_gather` 汇总（`distributed.gather_records`）。
 - 追踪下游指标：loss 曲线、梯度范数、最终准确率、PPL 变化；
   `distributed.all_gather_metrics` 提供每 rank 的 loss / grad norm。
@@ -287,20 +287,20 @@ def comm_hook(state, bucket):
 ### 7.1 结果分类（借鉴 NVBitFI，适配 LLM）
 
 `reporting.classify_summary` 同时使用检测/恢复记录和同配置基线做分类。基线按
-backend、model、device、world size、seed、steps 匹配；没有基线时只能给出
-detected / undetected。
+后端、模型、设备、world size、随机种子、步数匹配；没有基线时只能给出
+已检测 / 未检测。
 
 | 类别 | 判定 | 说明 |
 |---|---|---|
-| Baseline | 运行标记为 baseline | 无故障参考运行 |
-| No fault | 非 baseline 且无注入记录 | 检查 timing/stage/rank/bucket 配置，不应作为故障结果统计 |
-| Recovered | 检测 + 成功回滚 + loss/参数签名在容差内匹配基线 | 可称为“在给定容差内无损恢复” |
-| Mitigated | 检测 + 未回滚 + 无显著差异 | 典型为 sanitize；低开销但不保证严格无损 |
-| Detected, unrecovered | 检测到但最终状态仍偏离基线 | 恢复逻辑、checkpoint 重放或持续故障仍需排查 |
+| `baseline`（基线） | 运行标记为基线 | 无故障参考运行 |
+| `no_fault`（无故障） | 非基线且无注入记录 | 检查时序/阶段/rank/bucket 配置，不应作为故障结果统计 |
+| `recovered`（已恢复） | 检测 + 成功回滚 + loss/参数签名在容差内匹配基线 | 可称为“在给定容差内无损恢复” |
+| `mitigated`（已缓解） | 检测 + 未回滚 + 无显著差异 | 典型为 `sanitize`；低开销但不保证严格无损 |
+| `detected_unrecovered`（已检测未恢复） | 检测到但最终状态仍偏离基线 | 恢复逻辑、检查点重放或持续故障仍需排查 |
 | SDC | 未检测到但最终状态偏离基线 | 静默数据损坏，是最需要关注的可靠性失效 |
-| Masked | 未检测到且无可测偏离 | 可能命中无关元素、被数值误差吸收或被粗粒度指标掩盖 |
+| `masked`（已掩蔽） | 未检测到且无可测偏离 | 可能命中无关元素、被数值误差吸收或被粗粒度指标掩盖 |
 | DUE | 检测后 abort | 重试耗尽、无快照/检查点等可检测错误 |
-| Detected / Undetected | 无匹配基线时的降级分类 | 只能评估可观测性，不能确认是否发生 SDC |
+| `detected` / `undetected`（已检测/未检测） | 无匹配基线时的降级分类 | 只能评估可观测性，不能确认是否发生 SDC |
 
 ### 7.2 任务指标
 
@@ -309,22 +309,22 @@ detected / undetected。
 
 ### 7.3 敏感性分析
 
-- bit 位置（sign vs exponent vs mantissa）→ 故障影响排序。
-- 层敏感性（浅层 vs 深层）、阶段敏感性（forward vs backward vs optimizer）。
+- bit 位置（符号、指数、尾数）→ 故障影响排序。
+- 层敏感性（浅层与深层）、阶段敏感性（前向、反向、优化器）。
 
 ### 7.4 实验产物与聚合分析
 
-- `run_ddp.py` / `run_fsdp.py` 在每个运行目录写 `summary.json`，包含 resolved
-  config、所有 rank 的注入记录、loss 曲线、每步耗时、峰值显存、恢复事件、
+- `run_ddp.py` / `run_fsdp.py` 在每个运行目录写 `summary.json`，包含解析后的
+  配置、所有 rank 的注入记录、loss 曲线、每步耗时、峰值显存、恢复事件、
   最终梯度/参数签名和近似参数指纹。
 - `examples/analyze_runs.py --root <campaign_dir>` 聚合所有 summary，输出
   `recovered` / `mitigated` / `SDC` / `masked` / `DUE` 计数与比例，并按
-  fault model、injection point、bit region、rank、bucket、timing、mitigation
-  分组；同时输出相对基线的 step-time / peak-memory 开销。
+  故障模型、注入点、bit 区域、rank、bucket、时序、缓解策略分组；
+  同时输出相对基线的每步耗时与峰值显存开销。
 - `summary.json` 中的参数指纹由 signed sum、absolute sum、L2、位置加权和、
   max-abs 组成，采用分块 float64 计算以限制额外内存。它是紧凑的近似比较，
   不能替代完整 state-dict 的逐元素或逐比特对照。需要严格“无损”结论时，应
-  保存最终 state dict 或使用独立参考模型做精确比较。
+  保存最终状态字典或使用独立参考模型做精确比较。
 - 同一实验目录只能保存一个 summary；baseline 与各故障配置应使用不同
   `--log_dir`，分析时放在同一 campaign 根目录下。
 
@@ -345,13 +345,13 @@ model:
 distributed:
   backend: "fsdp"             # none | ddp | fsdp
   world_size: 4
-  inject_rank: 0              # single rank (null = use the fields below)
-  inject_ranks: null          # explicit subset, e.g. [0, 2]
-  inject_rank_fraction: 1.0   # deterministic random subset; 1.0 = all ranks
+  inject_rank: 0              # 单个 rank（null 表示使用下方策略字段）
+  inject_ranks: null          # 显式子集，例如 [0, 2]
+  inject_rank_fraction: 1.0   # 确定性随机子集；1.0 表示所有 rank
   injection_point: "before_reduce"  # before_reduce | after_reduce
-  bucket_index: null          # target one bucket per backward
-  fsdp_injection: "grad_shard"  # torch 1.12 fallback: param_shard | grad_shard | both
-  verify_comm: false          # checksum guard (DDP)
+  bucket_index: null          # 每次反向传播仅定位一个梯度桶
+  fsdp_injection: "grad_shard"  # torch 1.12 降级：param_shard | grad_shard | both
+  verify_comm: false          # 校验和守卫（DDP）
 
 fault:
   target: "gradient"          # weight|activation|kv_cache|loss|gradient|optimizer|master_weight|comm
@@ -404,10 +404,10 @@ tracker = StageTracker(cfg.run_mode)
 injector = FaultInjector(cfg, inspector, tracker, rng, optimizer)
 recovery = RecoveryManager(cfg, model, optimizer, tracker)
 
-injector.arm(ddp_model)     # comm 目标必须传入 DDP/FSDP 包装后的模型
+injector.arm(ddp_model)     # 通信目标必须传入 DDP/FSDP 包装后的模型
 recovery.begin_step()
-# ... forward / backward ...
-injector.inject_distributed_now()   # torch 1.12 FSDP 需要；DDP 为 no-op
+# ... 前向 / 反向传播 ...
+injector.inject_distributed_now()   # torch 1.12 FSDP 需要；DDP 下为空操作
 signals = recovery.check(loss, injector=injector)
 action = recovery.decide(signals)    # continue / retry_step / abort
 if action == "retry_step":
@@ -420,15 +420,15 @@ injector.disarm()
 
 ---
 
-## 9. Roadmap
+## 9. 路线图
 
 | 阶段 | 内容 | 里程碑 |
 |---|---|---|
-| **Phase 1** | 单卡推理：对齐并超越 LLMFI（真位翻转 + sign/exp/man 定向 + 时序） | 推理完整可用 |
-| **Phase 2** | 单卡训练：梯度/优化器/混合精度/损失注入 | 训练完整可用 |
-| **Phase 3** | 分布式：DDP 前后归约注入 + rank/bucket 策略 + 校验和；FSDP comm hook + torch 1.12 分片降级 | **v0.2 已完成，多卡可用** |
-| **Phase 4** | 检测/清洗/步级回滚/检查点回滚 + 每 rank 指标 | **v0.2 部分完成** |
-| **Phase 5** | 时序传播建模 + Campaign 编排 + 敏感性分析报告 | 完整工具发布 |
+| **阶段 1** | 单卡推理：对齐并超越 LLMFI（真实位翻转 + 符号/指数/尾数定向 + 时序） | 推理完整可用 |
+| **阶段 2** | 单卡训练：梯度/优化器/混合精度/损失注入 | 训练完整可用 |
+| **阶段 3** | 分布式：DDP 归约前/后注入 + rank/bucket 策略 + 校验和；FSDP 通信钩子 + torch 1.12 分片降级 | **v0.2 已完成，多卡可用** |
+| **阶段 4** | 检测/清洗/步级回滚/检查点回滚 + 每 rank 指标 | **v0.2 部分完成** |
+| **阶段 5** | 时序传播建模 + Campaign 编排 + 敏感性分析报告 | 完整工具发布 |
 
 ---
 

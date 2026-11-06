@@ -13,9 +13,33 @@ VALUE_TYPES = {"random_value", "zero", "nan", "inf", "scale"}
 STUCK_TYPES = {"stuck_at_0", "stuck_at_1"}
 
 
-def pick_bit_idxs(fault_type: str, dtype: torch.dtype, rng) -> List[int]:
-    """Select bit index/indices to flip for a bit-flip fault type."""
+def pick_bit_idxs(
+    fault_type: str,
+    dtype: torch.dtype,
+    rng,
+    bit_idx: Optional[int] = None,
+) -> List[int]:
+    """Select bit index/indices to flip for a bit-flip fault type.
+
+    When ``bit_idx`` is provided it pins the fault to that exact bit.  This is
+    useful for repeatable experiments that target a specific IEEE-754 region;
+    region-specific fault types reject an index outside their region.
+    """
     total = BitFlipper.total_bits(dtype)
+    if bit_idx is not None:
+        if not 0 <= bit_idx < total:
+            raise ValueError(
+                f"bit_idx {bit_idx} is outside the valid range [0, {total}) "
+                f"for {dtype}"
+            )
+        if fault_type in ("sign", "exponent", "mantissa"):
+            pool = BitFlipper.region_bits(dtype, fault_type)
+            if bit_idx not in pool:
+                raise ValueError(
+                    f"bit_idx {bit_idx} is not in the {fault_type} region "
+                    f"for {dtype}"
+                )
+        return [bit_idx]
     if fault_type == "single":
         return [rng.randrange(total)]
     if fault_type == "double":
@@ -45,7 +69,7 @@ def apply_fault(
     value-perturbation faults (no bit-level location).
     """
     if fault_type in BIT_FLIP_TYPES:
-        bits = pick_bit_idxs(fault_type, value.dtype, rng)
+        bits = pick_bit_idxs(fault_type, value.dtype, rng, bit_idx=bit_idx)
         return BitFlipper.flip(value, bits), bits
 
     if fault_type in STUCK_TYPES:
