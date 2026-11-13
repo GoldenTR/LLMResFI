@@ -35,11 +35,17 @@ def main() -> None:
         "--target-name", default="encoder.layers.0.linear1.weight"
     )
     parser.add_argument("--bit-position", type=int, default=12)
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     args = parser.parse_args()
 
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("CUDA was requested, but torch.cuda.is_available() is False")
+    device = torch.device(args.device)
     torch.manual_seed(42)
-    model = TinyTransformerLM().eval()
-    tokens = torch.randint(0, 32, (2, 5), generator=torch.Generator().manual_seed(7))
+    model = TinyTransformerLM().to(device).eval()
+    tokens = torch.randint(
+        0, 32, (2, 5), generator=torch.Generator().manual_seed(7)
+    ).to(device)
     target = select_target_tensor(model, target_name=args.target_name)
 
     with torch.no_grad():
@@ -55,7 +61,7 @@ def main() -> None:
     with torch.no_grad():
         after = model(tokens)
 
-    print(f"target={target.name} shape={target.shape} dtype={target.dtype}")
+    print(f"device={target.device} target={target.name} shape={target.shape} dtype={target.dtype}")
     print(f"bit={result.bit_position} type={result.bit_type.value} inplace={result.inplace}")
     print(f"max |forward delta| = {(after - before).abs().max().item():.8g}")
     print(f"forward output changed = {not torch.equal(before, after)}")

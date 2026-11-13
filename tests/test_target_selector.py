@@ -15,8 +15,8 @@ class TinyModel(torch.nn.Module):
         self.other = torch.nn.Parameter(torch.ones(5, dtype=torch.bfloat16))
 
 
-def test_select_exact_parameter_name():
-    model = TinyModel()
+def test_select_exact_parameter_name(device):
+    model = TinyModel().to(device)
     target = select_target_tensor(model, target_name="proj.weight")
     assert target.name == "proj.weight"
     assert target.tensor is model.proj.weight
@@ -28,13 +28,13 @@ def test_select_exact_parameter_name():
     assert "storage_offset" in target.describe()
 
 
-def test_missing_parameter_has_clear_error():
+def test_missing_parameter_has_clear_error(device):
     with pytest.raises(TargetSelectionError, match="not found"):
-        select_target_tensor(TinyModel(), target_name="does.not.exist")
+        select_target_tensor(TinyModel().to(device), target_name="does.not.exist")
 
 
-def test_dtype_filter_and_name_pattern():
-    model = TinyModel()
+def test_dtype_filter_and_name_pattern(device):
+    model = TinyModel().to(device)
     bf16 = list_target_tensors(model, dtype="bfloat16")
     assert [item.name for item in bf16] == ["other"]
     weight_targets = list_target_tensors(model, name_pattern=r"\.weight$")
@@ -43,8 +43,8 @@ def test_dtype_filter_and_name_pattern():
         select_target_tensor(model, dtype="float16", name_pattern="proj")
 
 
-def test_random_selection_is_reproducible_and_local():
-    model = TinyModel()
+def test_random_selection_is_reproducible_and_local(device):
+    model = TinyModel().to(device)
     random.seed(77)
     expected = random.random()
     random.seed(77)
@@ -56,8 +56,8 @@ def test_random_selection_is_reproducible_and_local():
     assert set(first) <= {"embed", "proj.weight", "proj.bias"}
 
 
-def test_direct_tensor_selection():
-    tensor = torch.ones(2, 2, dtype=torch.float16)
+def test_direct_tensor_selection(device):
+    tensor = torch.ones(2, 2, dtype=torch.float16, device=device)
     target = select_target_tensor(tensor)
     assert target.name == "<tensor>"
     assert target.tensor is tensor
@@ -67,8 +67,8 @@ def test_direct_tensor_selection():
         select_target_tensor(tensor, dtype="float32")
 
 
-def test_invalid_filters():
-    model = TinyModel()
+def test_invalid_filters(device):
+    model = TinyModel().to(device)
     with pytest.raises(TargetSelectionError):
         select_target_tensor(model, name_pattern="[")
     with pytest.raises(TargetSelectionError):

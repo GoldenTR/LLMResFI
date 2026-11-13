@@ -81,7 +81,7 @@ def main() -> None:
         choices=["persistent_low_precision", "transient_compute_copy", "amp_fp32_parameter"],
         default="persistent_low_precision",
     )
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--injection-steps", type=int, nargs="+", default=[3])

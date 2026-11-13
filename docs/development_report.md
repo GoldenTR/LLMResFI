@@ -68,6 +68,20 @@ Result:
 Total collected cases: 123. CUDA execution used `CUDA_VISIBLE_DEVICES=1` on an
 otherwise idle RTX 4090.
 
+CPU fallback command:
+
+```bash
+conda run -n llmresfi python -m pytest -q --device=cpu
+```
+
+Result:
+
+```text
+117 passed, 6 skipped, 0 failed
+```
+
+The six skips are the CUDA-specific dtype and non-contiguous storage tests.
+
 CUDA-only command:
 
 ```bash
@@ -83,17 +97,23 @@ Result:
 ## Runnable Commands
 
 ```bash
+# Examples default to CUDA.
 conda run -n llmresfi python examples/basic_bit_flip.py
 conda run -n llmresfi python examples/fp16_injection.py
 conda run -n llmresfi python examples/bf16_injection.py
 conda run -n llmresfi python examples/fp32_injection.py
 conda run -n llmresfi python examples/model_parameter_injection.py
 conda run -n llmresfi python examples/training_loop_integration.py \
-  --mode persistent_low_precision --device cpu --dtype bfloat16 --steps 6 --injection-steps 3
+  --mode persistent_low_precision --dtype bfloat16 --steps 6 --injection-steps 3
 CUDA_VISIBLE_DEVICES=1 conda run -n llmresfi python -m pytest -q
+
+# CPU fallback is available for every example.
+conda run -n llmresfi python examples/basic_bit_flip.py --device cpu
+conda run -n llmresfi python examples/training_loop_integration.py \
+  --mode persistent_low_precision --device cpu --dtype bfloat16 --steps 6 --injection-steps 3
 ```
 
-All non-CUDA examples above were executed successfully in the audited
+The CUDA and CPU fallback paths were both executed successfully in the audited
 environment.
 
 ## Known Limitations

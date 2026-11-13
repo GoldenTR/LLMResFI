@@ -70,7 +70,8 @@ conda run -n llmresfi python scripts/environment_check.py \
 import torch
 from llmresfi import inject_bit_flip, pattern_to_binary
 
-x = torch.tensor([1.0, -2.5, 0.0], dtype=torch.float16)
+device = torch.device("cuda")
+x = torch.tensor([1.0, -2.5, 0.0], dtype=torch.float16, device=device)
 result = inject_bit_flip(
     x,
     flat_index=1,
@@ -91,7 +92,11 @@ print(result.only_target_bit_changed)  # True
 可直接运行：
 
 ```bash
+# 默认使用 CUDA
 conda run -n llmresfi python examples/basic_bit_flip.py
+
+# 显式使用 CPU
+conda run -n llmresfi python examples/basic_bit_flip.py --device cpu
 ```
 
 ## Bit 编号与浮点格式
@@ -124,7 +129,8 @@ assert get_float_format(torch.float16).mantissa_bits == 10
 import torch
 from llmresfi import inject_bit_flip
 
-x = torch.tensor([-2.5], dtype=torch.float16)
+device = torch.device("cuda")
+x = torch.tensor([-2.5], dtype=torch.float16, device=device)
 for bit in (0, 10, 15):  # mantissa / exponent / sign
     result = inject_bit_flip(x, 0, bit)
     print(bit, result.bit_type.value, result.original_value, result.corrupted_value)
@@ -132,6 +138,7 @@ for bit in (0, 10, 15):  # mantissa / exponent / sign
 
 ```bash
 conda run -n llmresfi python examples/fp16_injection.py
+conda run -n llmresfi python examples/fp16_injection.py --device cpu
 ```
 
 ## BF16 注入
@@ -140,13 +147,15 @@ conda run -n llmresfi python examples/fp16_injection.py
 import torch
 from llmresfi import inject_bit_flip
 
-x = torch.tensor([-2.5], dtype=torch.bfloat16)
+device = torch.device("cuda")
+x = torch.tensor([-2.5], dtype=torch.bfloat16, device=device)
 result = inject_bit_flip(x, 0, 7)  # BF16 exponent LSB
 assert result.bit_type.value == "exponent"
 ```
 
 ```bash
 conda run -n llmresfi python examples/bf16_injection.py
+conda run -n llmresfi python examples/bf16_injection.py --device cpu
 ```
 
 ## FP32 注入
@@ -155,13 +164,15 @@ conda run -n llmresfi python examples/bf16_injection.py
 import torch
 from llmresfi import inject_bit_flip
 
-x = torch.tensor([-2.5], dtype=torch.float32)
+device = torch.device("cuda")
+x = torch.tensor([-2.5], dtype=torch.float32, device=device)
 result = inject_bit_flip(x, 0, 31)  # sign
 assert result.corrupted_value == 2.5
 ```
 
 ```bash
 conda run -n llmresfi python examples/fp32_injection.py
+conda run -n llmresfi python examples/fp32_injection.py --device cpu
 ```
 
 ## 模型参数注入
@@ -173,7 +184,8 @@ conda run -n llmresfi python examples/fp32_injection.py
 import torch
 from llmresfi import inject_bit_flip, select_target_tensor
 
-model = torch.nn.Linear(8, 4)
+device = torch.device("cuda")
+model = torch.nn.Linear(8, 4).to(device)
 target = select_target_tensor(
     model,
     target_name="weight",
@@ -196,6 +208,7 @@ print(result.original_value, result.corrupted_value)
 
 ```bash
 conda run -n llmresfi python examples/model_parameter_injection.py
+conda run -n llmresfi python examples/model_parameter_injection.py --device cpu
 ```
 
 ## 指定训练 Step 注入
@@ -258,21 +271,26 @@ results = inject_bit_flips(weight, [(0, 10), (10, 10), (100, 10)], inplace=False
 
 ## 训练循环集成
 
-训练循环示例位于 `examples/training_loop_integration.py`，默认使用 CPU BF16，
-也可以切换到 CUDA/FP16。它实际执行 forward、backward、AdamW step，并验证注入
-不会破坏正常 autograd 流程。
+训练循环示例位于 `examples/training_loop_integration.py`，默认使用 CUDA BF16，
+可通过 `--device cpu` 回退到 CPU。它实际执行 forward、backward、AdamW step，并
+验证注入不会破坏正常 autograd 流程。
 
 ```bash
 conda run -n llmresfi python examples/training_loop_integration.py \
+  --mode persistent_low_precision --dtype bfloat16 \
+  --steps 6 --injection-steps 3
+
+conda run -n llmresfi python examples/training_loop_integration.py \
+  --mode transient_compute_copy --dtype bfloat16 \
+  --steps 6 --injection-steps 3
+
+conda run -n llmresfi python examples/training_loop_integration.py \
+  --mode amp_fp32_parameter --dtype bfloat16 \
+  --steps 6 --injection-steps 3
+
+# CPU 回退：在任一命令后追加 --device cpu
+conda run -n llmresfi python examples/training_loop_integration.py \
   --mode persistent_low_precision --device cpu --dtype bfloat16 \
-  --steps 6 --injection-steps 3
-
-conda run -n llmresfi python examples/training_loop_integration.py \
-  --mode transient_compute_copy --device cpu --dtype bfloat16 \
-  --steps 6 --injection-steps 3
-
-conda run -n llmresfi python examples/training_loop_integration.py \
-  --mode amp_fp32_parameter --device cpu --dtype bfloat16 \
   --steps 6 --injection-steps 3
 ```
 
@@ -438,9 +456,16 @@ print(config.experiment.experiment_id, scheduler.injection_steps)
 
 ## 测试
 
+测试默认在 CUDA Tensor 上执行；使用 `--device=cpu` 显式运行 CPU 路径，此时
+`tests/test_cuda.py` 会自动 skip。
+
 ```bash
+# 默认 CUDA
 CUDA_VISIBLE_DEVICES=1 conda run -n llmresfi python -m pytest -q
 CUDA_VISIBLE_DEVICES=1 conda run -n llmresfi python -m pytest -q -m cuda
+
+# CPU 回退
+conda run -n llmresfi python -m pytest -q --device=cpu
 ```
 
 本次实际结果：
@@ -450,6 +475,7 @@ CUDA_VISIBLE_DEVICES=1 conda run -n llmresfi python -m pytest -q -m cuda
 - 失败：0
 - 跳过：0
 - CUDA 专项测试：`6 passed`（在 GPU 1 上执行）
+- CPU 回退模式：`117 passed, 6 skipped`（CUDA 专项测试自动跳过）
 
 测试覆盖三种 dtype 的 sign/exponent/mantissa、边界 bit、NaN/Inf/0/负数、原地与
 非原地、CPU、非连续切片与共享存储、调度去重、随机可复现、JSONL/CSV 日志、失败

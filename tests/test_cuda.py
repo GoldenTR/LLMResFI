@@ -7,21 +7,10 @@ from llmresfi.injector import inject_bit_flip
 
 pytestmark = pytest.mark.cuda
 
-if not torch.cuda.is_available():
-    pytestmark = [
-        pytest.mark.cuda,
-        pytest.mark.skip(
-            reason=(
-                "CUDA is unavailable in this runtime: torch.cuda.is_available() is False "
-                "(NVIDIA driver/NVML unavailable; no /dev/nvidia* devices)."
-            )
-        ),
-    ]
-
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_cuda_bit_flip_pattern_verification(dtype):
-    tensor = torch.tensor([1.0, -2.5, 0.0], dtype=dtype, device="cuda")
+def test_cuda_bit_flip_pattern_verification(dtype, cuda_device):
+    tensor = torch.tensor([1.0, -2.5, 0.0], dtype=dtype, device=cuda_device)
     fmt = get_float_format(dtype)
     original = tensor_bit_pattern(tensor[1])
     for bit in (0, fmt.exponent_lsb, fmt.sign_bit):
@@ -34,8 +23,8 @@ def test_cuda_bit_flip_pattern_verification(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_cuda_noncontiguous_inplace(dtype):
-    base = torch.arange(12, dtype=dtype, device="cuda").reshape(3, 4)
+def test_cuda_noncontiguous_inplace(dtype, cuda_device):
+    base = torch.arange(12, dtype=dtype, device=cuda_device).reshape(3, 4)
     view = base.t()
     before = base.clone()
     inject_bit_flip(view, 5, 0, inplace=True, synchronize=True)

@@ -11,7 +11,7 @@ from llmresfi import inject_bit_flip, pattern_to_binary
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     parser.add_argument("--flat-index", type=int, default=1)
     parser.add_argument("--bit-position", type=int, default=10)
     return parser.parse_args()

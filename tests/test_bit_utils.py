@@ -25,7 +25,9 @@ LAYOUTS = [
 
 
 @pytest.mark.parametrize("dtype,name,sign,exponent,mantissa,view_dtype,one_pattern", LAYOUTS)
-def test_float_format_layout(dtype, name, sign, exponent, mantissa, view_dtype, one_pattern):
+def test_float_format_layout(
+    dtype, name, sign, exponent, mantissa, view_dtype, one_pattern, device
+):
     fmt = get_float_format(dtype)
     assert fmt.name == name
     assert fmt.dtype == dtype
@@ -35,7 +37,9 @@ def test_float_format_layout(dtype, name, sign, exponent, mantissa, view_dtype, 
     assert fmt.total_bits == sign + exponent + mantissa
     assert fmt.int_view_dtype == view_dtype
     assert fmt.bit_mask == (1 << fmt.total_bits) - 1
-    assert tensor_bit_pattern(torch.tensor(1.0, dtype=dtype)) == one_pattern
+    assert (
+        tensor_bit_pattern(torch.tensor(1.0, dtype=dtype, device=device)) == one_pattern
+    )
 
 
 @pytest.mark.parametrize("dtype,_name,_s,_e,_m,_view,_one", LAYOUTS)
@@ -95,17 +99,22 @@ def test_bit_type_coercion():
         coerce_bit_type("leading")
 
 
-def test_tensor_bit_pattern_requires_scalar():
+def test_tensor_bit_pattern_requires_scalar(device):
     with pytest.raises(ValueError):
-        tensor_bit_pattern(torch.ones(2, dtype=torch.float16))
+        tensor_bit_pattern(torch.ones(2, dtype=torch.float16, device=device))
     with pytest.raises(TypeError):
         tensor_bit_pattern([1.0])  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("dtype,_name,_s,_e,_m,_view,_one", LAYOUTS)
-def test_special_values_have_stable_patterns(dtype, _name, _s, _e, _m, _view, _one):
+def test_special_values_have_stable_patterns(
+    dtype, _name, _s, _e, _m, _view, _one, device
+):
     values = [0.0, -0.0, float("inf"), float("-inf"), float("nan")]
-    patterns = [tensor_bit_pattern(torch.tensor(value, dtype=dtype)) for value in values]
+    patterns = [
+        tensor_bit_pattern(torch.tensor(value, dtype=dtype, device=device))
+        for value in values
+    ]
     assert len(set(patterns)) == len(patterns)
     assert patterns[0] == 0
     assert patterns[1] == (1 << (get_float_format(dtype).total_bits - 1))
