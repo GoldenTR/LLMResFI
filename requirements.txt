@@ -1,0 +1,8 @@
+# Runtime dependencies for LLMResFI v0.1.
+# Prefer the existing llmresfi Conda environment rather than reinstalling CUDA/PyTorch.
+torch>=2.0
+PyYAML>=6.0
+
+# Test dependency
+pytest>=7.0
+

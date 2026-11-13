@@ -1,0 +1,26 @@
+experiment:
+  experiment_id: exp_001
+  seed: 42
+
+fault:
+  enabled: true
+  target_type: model_parameter
+  target_name: transformer.h.0.attn.c_attn.weight
+
+  dtype: float16
+
+  injection_mode: single_bit
+  bit_type: exponent
+
+  # Training steps are zero-based and match enumerate(dataloader).
+  injection_step: 100
+  injection_count: 1
+
+  selection_mode: random_element
+
+logging:
+  enabled: true
+  format: jsonl
+  output_dir: logs/exp_001
+  save_tensor_backup: false
+

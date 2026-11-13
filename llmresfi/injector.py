@@ -1,410 +1,417 @@
-# llmresfi/injector.py
-"""FaultInjector: unified injection engine for inference and training.
+"""Tensor-level IEEE-754 bit-flip injection.
 
-Handles *where* (target/layer/module/param), *when* (stage + timing), and
-*how* (fault model) to inject a soft error.
-
-Usage
------
-    rng = random.Random(seed)
-    inspector = ModelInspector(model, optimizer)
-    tracker = StageTracker(cfg.run_mode)
-    injector = FaultInjector(cfg, inspector, tracker, rng, optimizer)
-
-    injector.arm()          # register hooks / patch optimizer / comm hooks
-    # ... run training or inference, advancing `tracker` at each stage ...
-    injector.disarm()       # remove hooks, restore weights
-
-Timing semantics (see ``hooks.TimingGate``):
-    transient:    fire once (default; one fault per run)
-    permanent:    re-fire on the first ``steps`` eligible triggers
-    intermittent: fire on every ``period``-th eligible trigger
-
-Weight faults are single-shot by nature: they flip once and remain corrupted
-until ``disarm()`` (persistence is achieved by keeping the flip, not by
-re-flipping).
+This module performs *software data corruption* on PyTorch tensors.  It does
+not model physical GPU SRAM/cache/register upsets.  Fault locations and timing
+must be chosen by the caller or by the deterministic helpers in this module.
 """
+
 from __future__ import annotations
 
 import random
-import re
-from typing import List, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Sequence
 
 import torch
 
-from .config import FIConfig
-from .hooks import TimingGate, apply_fault_to_scalar, flip_flat, has_2d_weight
-from .inspector import ModelInspector
-from .scheduler import StageTracker
+from .bit_utils import (
+    BitType,
+    FloatFormat,
+    coerce_bit_type,
+    get_bit_type,
+    get_float_format,
+)
+from .exceptions import (
+    InjectionVerificationError,
+    InvalidBitPositionError,
+    InvalidFlatIndexError,
+    UnsafeInjectionError,
+)
 
 
-class FaultInjector:
-    def __init__(
-        self,
-        cfg: FIConfig,
-        inspector: ModelInspector,
-        tracker: StageTracker,
-        rng: random.Random,
-        optimizer=None,
-    ):
-        self.cfg = cfg
-        self.insp = inspector
-        self.tracker = tracker
-        self.rng = rng
-        self.optimizer = optimizer
+@dataclass(frozen=True)
+class BitFlipSpec:
+    """One logical fault location: flat element index plus bit index."""
 
-        self._hook_handles: List = []
-        self._weight_backup: Optional[Tuple[torch.nn.Module, Tuple[int, int], torch.Tensor]] = None
-        self._weight_fired = False
-        self._original_step = None
-        self._timing = TimingGate(cfg.fault.timing)
-        self._model = None
-        self.record: Optional[dict] = None
-        self.records: List[dict] = []
-        self.comm_signals: List[dict] = []
+    flat_index: int
+    bit_position: int
 
-    # ------------------------------------------------------------------
-    # public API
-    # ------------------------------------------------------------------
-    def arm(self, model=None):
-        """Register hooks.
 
-        ``model`` should be the *wrapped* module for distributed comm targets
-        (the ``DistributedDataParallel`` or FSDP root).  For non-comm targets
-        the inspector's underlying model is used when ``model`` is omitted.
-        """
-        self._model = model if model is not None else self.insp.model
-        target = self.cfg.fault.target
-        if target == "weight":
-            self._arm_weight()
-        elif target == "activation":
-            self._arm_activation()
-        elif target == "kv_cache":
-            self._arm_kv_cache()
-        elif target == "gradient":
-            self._arm_gradient()
-        elif target == "optimizer":
-            self._arm_optimizer()
-        elif target == "master_weight":
-            self._arm_master_weight()
-        elif target == "loss":
-            pass  # loss is injected explicitly via inject_loss() during the loop
-        elif target == "comm":
-            self._arm_comm()
-        else:
-            raise ValueError(f"Unknown fault target: {target}")
+@dataclass(frozen=True)
+class InjectionResult:
+    """Structured result of one independently traceable bit-flip event."""
 
-    def disarm(self):
-        for h in self._hook_handles:
-            h.remove()
-        self._hook_handles = []
-        if self._weight_backup is not None:
-            module, (r, c), orig = self._weight_backup
-            with torch.no_grad():
-                module.weight.data[r, c] = orig
-            self._weight_backup = None
-        if self._original_step is not None and self.optimizer is not None:
-            self.optimizer.step = self._original_step
-            self._original_step = None
-        self.disarm_comm()
+    tensor: torch.Tensor
+    flat_index: int
+    bit_position: int
+    bit_type: BitType
+    original_value: float
+    corrupted_value: float
+    original_bit_pattern: int
+    corrupted_bit_pattern: int
+    dtype: torch.dtype
+    device: torch.device
+    tensor_shape: tuple[int, ...]
+    inplace: bool
+    injection_success: bool
+    execution_time_ns: int
+    injection_timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    tensor_version_before: int | None = None
+    tensor_version_after: int | None = None
+    parameter_version: int | str | None = None
+    injection_phase: str | None = None
+    tensor_name: str | None = None
+    step: int | None = None
+    random_seed: int | None = None
 
-    # ------------------------------------------------------------------
-    # internal helpers
-    # ------------------------------------------------------------------
-    def _phase_ok(self) -> bool:
-        s = self.cfg.fault.stage
-        return self.tracker.matches(s.type, s.token_step)
-
-    def _comm_phase_ok(self) -> bool:
-        """Comm collectives run inside backward for both DDP and FSDP.
-
-        A configured ``stage: comm`` is therefore treated as matching the
-        backward phase, while ``stage: backward`` also works unchanged.
-        """
-        s = self.cfg.fault.stage
-        if s.type == "comm":
-            return self.tracker.stage in ("backward", "comm")
-        return self.tracker.matches(s.type, s.token_step)
-
-    def _time_step(self):
-        if self.tracker.run_mode == "training":
-            return self.tracker.step
-        if self.tracker.stage == "decode":
-            return self.tracker.token_step
-        return None
-
-    def _should_fire(self) -> bool:
-        return self._should_fire_with_phase(self._phase_ok())
-
-    def _should_fire_comm(self) -> bool:
-        return self._should_fire_with_phase(self._comm_phase_ok())
-
-    def _should_fire_with_phase(self, phase_ok: bool) -> bool:
-        """Timing gate with a caller-provided phase predicate (distributed hooks)."""
-        step = self._time_step()
-        if phase_ok and self._timing.should_fire(step):
-            self._timing.mark_fired(step)
-            return True
-        return False
-
-    def _resolve_target(self):
-        f = self.cfg.fault
-        if f.locate == "manual":
-            if f.layer_idx is None or f.module_regex is None:
-                raise ValueError("layer_idx and module_regex must be set when locate == 'manual'")
-            return f.layer_idx, f.module_regex
-        layer_idx = self.insp.random_layer(self.rng)
-        return layer_idx, ".*"
-
-    def _pick_weightable_module(self, layer_idx: int, mod_regex: str):
-        pattern = re.compile(mod_regex)
-        layer_list = self.insp.modules_by_layer.get(layer_idx, [])
-        by_regex = [m for m in layer_list if pattern.fullmatch(m.name)]
-        filtered = [m for m in by_regex if has_2d_weight(m)]
-        if not filtered:
-            filtered = [m for m in layer_list if has_2d_weight(m)]
-        if not filtered:
-            raise ValueError(
-                f"No 2D-weight module found in layer {layer_idx} for regex='{mod_regex}'."
-            )
-        return self.rng.choice(filtered)
-
-    # ------------------------------------------------------------------
-    # weight (inference & training forward) - single-shot
-    # ------------------------------------------------------------------
-    def _arm_weight(self):
-        layer_idx, mod_regex = self._resolve_target()
-        mod_info = self._pick_weightable_module(layer_idx, mod_regex)
-
-        def pre_hook(module, _inputs):
-            if self._weight_fired or not self._phase_ok():
-                return
-            W = module.weight.data
-            row = self.rng.randrange(W.shape[0])
-            col = self.rng.randrange(W.shape[1])
-            orig = W[row, col].clone()
-            corrupted, bits = apply_fault_to_scalar(W[row, col], self.cfg.fault.fault_model, self.rng)
-            W[row, col] = corrupted
-            self._weight_backup = (module, (row, col), orig)
-            self.record = self._make_record(
-                "weight",
-                layer_idx=layer_idx,
-                module_path=mod_info.name,
-                row=row,
-                col=col,
-                bit_idxs=bits,
-            )
-            self._weight_fired = True
-            # weight stays corrupted until disarm; never re-fire
-            handle = self._hook_handles[0]
-            handle.remove()
-
-        self._hook_handles.append(mod_info.module.register_forward_pre_hook(pre_hook))
-
-    # ------------------------------------------------------------------
-    # activation (inference & training forward) - ephemeral
-    # ------------------------------------------------------------------
-    def _arm_activation(self):
-        layer_idx, mod_regex = self._resolve_target()
-        mod_info = self.insp.pick_module(layer_idx, mod_regex, self.rng)
-
-        def hook(_, __, output):
-            if not self._should_fire():
-                return output
-            tensor = output[0] if isinstance(output, tuple) else output
-            flat_idx = self.rng.randrange(tensor.numel())
-            bits = flip_flat(tensor, flat_idx, self.cfg.fault.fault_model, self.rng)
-            self.record = self._make_record(
-                "activation",
-                layer_idx=layer_idx,
-                module_path=mod_info.name,
-                flat_idx=flat_idx,
-                bit_idxs=bits,
-            )
-            return output
-
-        self._hook_handles.append(mod_info.module.register_forward_hook(hook))
-
-    # ------------------------------------------------------------------
-    # kv_cache (inference)
-    # ------------------------------------------------------------------
-    def _arm_kv_cache(self):
-        layer_idx, mod_regex = self._resolve_target()
-        attn_mod = self.insp.pick_module(layer_idx, mod_regex, self.rng).module
-
-        def hook(module, _, output):
-            if not self._should_fire():
-                return output
-            pkv = output[-1]
-            lyr = layer_idx % len(pkv)
-            K, V = pkv[lyr]
-            tensor = K if self.rng.random() < 0.5 else V
-            flat_idx = self.rng.randrange(tensor.numel())
-            bits = flip_flat(tensor, flat_idx, self.cfg.fault.fault_model, self.rng)
-            self.record = self._make_record(
-                "kv_cache",
-                layer_idx=layer_idx,
-                module_path=attn_mod.__class__.__name__,
-                flat_idx=flat_idx,
-                bit_idxs=bits,
-                kv="K" if tensor is K else "V",
-            )
-            return output
-
-        self._hook_handles.append(attn_mod.register_forward_hook(hook))
-
-    # ------------------------------------------------------------------
-    # loss (training) - injected explicitly during the loop
-    # ------------------------------------------------------------------
-    def inject_loss(self, loss: torch.Tensor) -> Optional[dict]:
-        if self.cfg.fault.target != "loss":
-            return None
-        if not self._should_fire():
-            return None
-        flat_idx = self.rng.randrange(loss.numel())
-        bits = flip_flat(loss, flat_idx, self.cfg.fault.fault_model, self.rng)
-        self.record = self._make_record("loss", flat_idx=flat_idx, bit_idxs=bits)
-        return self.record
-
-    # ------------------------------------------------------------------
-    # gradient (training) - via parameter autograd hook
-    # ------------------------------------------------------------------
-    def _arm_gradient(self):
-        param_info = self.insp.random_param(self.rng)
-        p = param_info.param
-
-        def grad_hook(grad):
-            if grad is None or not self._should_fire():
-                return grad
-            flat_idx = self.rng.randrange(grad.numel())
-            bits = flip_flat(grad, flat_idx, self.cfg.fault.fault_model, self.rng)
-            self.record = self._make_record(
-                "gradient",
-                param_path=param_info.name,
-                flat_idx=flat_idx,
-                bit_idxs=bits,
-            )
-            return grad
-
-        self._hook_handles.append(p.register_hook(grad_hook))
-
-    # ------------------------------------------------------------------
-    # optimizer state (training) - patch optimizer.step()
-    # ------------------------------------------------------------------
-    def _arm_optimizer(self):
-        if self.optimizer is None:
-            raise ValueError("Optimizer injection requires an optimizer.")
-        param_info = self.insp.random_param(self.rng)
-        p = param_info.param
-        original_step = self.optimizer.step
-
-        def wrapped_step(*args, **kwargs):
-            if self._should_fire():
-                self._inject_optimizer_state(p, param_info.name)
-            return original_step(*args, **kwargs)
-
-        self.optimizer.step = wrapped_step
-        self._original_step = original_step
-
-    def _inject_optimizer_state(self, p, param_path: str):
-        state = self.optimizer.state.get(p, {})
-        if "exp_avg" in state:
-            tensor, key = state["exp_avg"], "exp_avg"
-        elif "exp_avg_sq" in state:
-            tensor, key = state["exp_avg_sq"], "exp_avg_sq"
-        else:
-            # first Adam step: state not initialized yet -> corrupt param
-            tensor, key = p.data, "param"
-        flat_idx = self.rng.randrange(tensor.numel())
-        bits = flip_flat(tensor, flat_idx, self.cfg.fault.fault_model, self.rng)
-        self.record = self._make_record(
-            "optimizer",
-            param_path=param_path,
-            state_key=key,
-            flat_idx=flat_idx,
-            bit_idxs=bits,
+    @property
+    def target_bit_changed(self) -> bool:
+        return bool(
+            (self.original_bit_pattern ^ self.corrupted_bit_pattern)
+            & (1 << self.bit_position)
         )
 
-    # ------------------------------------------------------------------
-    # master weight (training) - corrupt param.data at optimizer step
-    # ------------------------------------------------------------------
-    def _arm_master_weight(self):
-        if self.optimizer is None:
-            raise ValueError("master_weight injection requires an optimizer.")
-        param_info = self.insp.random_param(self.rng)
-        p = param_info.param
-        original_step = self.optimizer.step
+    @property
+    def only_target_bit_changed(self) -> bool:
+        return (self.original_bit_pattern ^ self.corrupted_bit_pattern) == (
+            1 << self.bit_position
+        )
 
-        def wrapped_step(*args, **kwargs):
-            if self._should_fire():
-                flat_idx = self.rng.randrange(p.data.numel())
-                bits = flip_flat(p.data, flat_idx, self.cfg.fault.fault_model, self.rng)
-                self.record = self._make_record(
-                    "master_weight",
-                    param_path=param_info.name,
-                    flat_idx=flat_idx,
-                    bit_idxs=bits,
-                )
-            return original_step(*args, **kwargs)
 
-        self.optimizer.step = wrapped_step
-        self._original_step = original_step
+def _validate_flat_index(tensor: torch.Tensor, flat_index: int) -> None:
+    if isinstance(flat_index, bool) or not isinstance(flat_index, int):
+        raise InvalidFlatIndexError(
+            f"flat_index must be an integer, got {type(flat_index).__name__}"
+        )
+    numel = tensor.numel()
+    if flat_index < 0 or flat_index >= numel:
+        raise InvalidFlatIndexError(
+            f"flat_index {flat_index} is out of range for tensor with numel={numel}; "
+            "negative indexing is not supported"
+        )
 
-    # ------------------------------------------------------------------
-    # comm (distributed) - delegate to the distributed layer
-    # ------------------------------------------------------------------
-    def _arm_comm(self):
-        from .distributed import make_comm_injector
 
-        self._comm_injector = make_comm_injector(self.cfg, self)
-        self._comm_injector.arm(self._model)
+def _validate_bit_position(fmt: FloatFormat, bit_position: int) -> None:
+    if isinstance(bit_position, bool) or not isinstance(bit_position, int):
+        raise InvalidBitPositionError(
+            f"bit_position must be an integer, got {type(bit_position).__name__}"
+        )
+    if bit_position < 0 or bit_position >= fmt.total_bits:
+        raise InvalidBitPositionError(
+            f"bit_position {bit_position} is out of range for {fmt.name}; "
+            f"valid range is [0, {fmt.total_bits - 1}]"
+        )
 
-    def disarm_comm(self):
-        if getattr(self, "_comm_injector", None) is not None:
-            self._comm_injector.disarm()
 
-    def inject_distributed_now(self) -> None:
-        """Run non-collective distributed injections (legacy FSDP shard grads).
+def _logical_flat_coordinates(tensor: torch.Tensor, flat_index: int) -> tuple[int, ...]:
+    """Convert a row-major logical flat index to a multidimensional index."""
 
-        DDP and modern FSDP inject inside their collective hooks, so this is a
-        no-op for them.  Legacy FSDP (torch < 2.0) has no comm hook; call this
-        after backward and before ``optimizer.step``.
-        """
-        if getattr(self, "_comm_injector", None) is not None:
-            self._comm_injector.inject_now()
+    if tensor.dim() == 0:
+        return ()
+    remaining = flat_index
+    coordinates = [0] * tensor.dim()
+    for axis in range(tensor.dim() - 1, -1, -1):
+        size = int(tensor.shape[axis])
+        coordinates[axis] = remaining % size
+        remaining //= size
+    return tuple(coordinates)
 
-    def add_comm_signal(self, signal: dict) -> None:
-        self.comm_signals.append(signal)
 
-    def drain_comm_signals(self) -> list:
-        signals, self.comm_signals = self.comm_signals, []
-        return signals
+def _select_flat_element(tensor: torch.Tensor, flat_index: int) -> torch.Tensor:
+    """Return a zero-dimensional *view* of the logical flat element.
 
-    # ------------------------------------------------------------------
-    # record helper
-    # ------------------------------------------------------------------
-    def _make_record(self, target, **extra) -> dict:
-        try:
-            import torch.distributed as dist
+    Basic integer indexing returns a view, so an in-place bit operation reaches
+    the original storage instead of a copied, contiguous reshape.
+    """
 
-            if dist.is_available() and dist.is_initialized():
-                rank = dist.get_rank()
-                world_size = dist.get_world_size()
-            else:
-                rank, world_size = 0, 1
-        except Exception:
-            rank, world_size = 0, 1
-        rec = {
-            "target": target,
-            "fault_model": self.cfg.fault.fault_model.type,
-            "timing": self.cfg.fault.timing.type,
-            "stage": self.tracker.stage,
-            "configured_stage": self.cfg.fault.stage.type,
-            "step": self.tracker.step,
-            "token_step": self.tracker.token_step,
-            "rank": rank,
-            "world_size": world_size,
-        }
-        rec.update(extra)
-        self.records.append(rec)
-        return rec
+    coordinates = _logical_flat_coordinates(tensor, flat_index)
+    return tensor[coordinates]
+
+
+def _signed_mask(mask: int, total_bits: int) -> int:
+    """Represent an unsigned XOR mask as a two's-complement signed integer."""
+
+    sign_threshold = 1 << (total_bits - 1)
+    return mask if mask < sign_threshold else mask - (1 << total_bits)
+
+
+def _flip_pattern(element: torch.Tensor, fmt: FloatFormat, bit_position: int) -> None:
+    mask = 1 << bit_position
+    view = element.view(fmt.int_view_dtype)
+    # Signed integer XOR operates on the same two's-complement bit pattern as
+    # the unsigned IEEE-754 word.  Using a signed mask avoids overflow when the
+    # sign bit or FP32 exponent MSB is targeted.
+    view.bitwise_xor_(_signed_mask(mask, fmt.total_bits))
+
+
+def _sync_if_requested(tensor: torch.Tensor, synchronize: bool) -> None:
+    if synchronize and tensor.device.type == "cuda":
+        torch.cuda.synchronize(tensor.device)
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    try:
+        return int(tensor._version)
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _inject_one(
+    work: torch.Tensor,
+    spec: BitFlipSpec,
+    *,
+    inplace: bool,
+    tensor_name: str | None,
+    step: int | None,
+    random_seed: int | None,
+    synchronize: bool,
+    parameter_version: int | str | None,
+    injection_phase: str | None,
+) -> InjectionResult:
+    _validate_flat_index(work, spec.flat_index)
+    fmt = get_float_format(work)
+    _validate_bit_position(fmt, spec.bit_position)
+
+    if inplace and work.requires_grad and work.grad_fn is not None:
+        raise UnsafeInjectionError(
+            "Refusing an in-place fault injection into a non-leaf tensor with a live "
+            "autograd graph because it would invalidate backward(). Inject after the "
+            "relevant tensor has been consumed, use a persistent leaf parameter, or "
+            "use inplace=False and feed the returned tensor into subsequent computation."
+        )
+
+    _sync_if_requested(work, synchronize)
+    started = time.perf_counter_ns()
+    injection_timestamp = datetime.now(timezone.utc).isoformat()
+    version_before = _tensor_version(work)
+    target = _select_flat_element(work, spec.flat_index)
+    original_pattern = int(target.detach().reshape(1).view(fmt.int_view_dtype).item())
+    original_pattern &= fmt.bit_mask
+    original_value = float(target.detach().item())
+
+    mask = 1 << spec.bit_position
+    with torch.no_grad():
+        _flip_pattern(target, fmt, spec.bit_position)
+
+    corrupted_pattern = int(target.detach().reshape(1).view(fmt.int_view_dtype).item())
+    corrupted_pattern &= fmt.bit_mask
+    corrupted_value = float(target.detach().item())
+    version_after = _tensor_version(work)
+    expected_pattern = original_pattern ^ mask
+
+    if corrupted_pattern != expected_pattern or (original_pattern ^ corrupted_pattern) != mask:
+        # Do not leave an unverified in-place mutation behind.
+        if inplace:
+            with torch.no_grad():
+                _flip_pattern(target, fmt, spec.bit_position)
+        raise InjectionVerificationError(
+            f"Bit-flip verification failed for dtype={fmt.name}, flat_index="
+            f"{spec.flat_index}, bit_position={spec.bit_position}: expected pattern "
+            f"0x{expected_pattern:x}, observed 0x{corrupted_pattern:x}"
+        )
+
+    _sync_if_requested(work, synchronize)
+    elapsed_ns = time.perf_counter_ns() - started
+    return InjectionResult(
+        tensor=work,
+        flat_index=spec.flat_index,
+        bit_position=spec.bit_position,
+        bit_type=get_bit_type(fmt.dtype, spec.bit_position),
+        original_value=original_value,
+        corrupted_value=corrupted_value,
+        original_bit_pattern=original_pattern,
+        corrupted_bit_pattern=corrupted_pattern,
+        dtype=work.dtype,
+        device=work.device,
+        tensor_shape=tuple(work.shape),
+        inplace=inplace,
+        injection_success=True,
+        execution_time_ns=elapsed_ns,
+        injection_timestamp=injection_timestamp,
+        tensor_version_before=version_before,
+        tensor_version_after=version_after,
+        parameter_version=parameter_version,
+        injection_phase=injection_phase,
+        tensor_name=tensor_name,
+        step=step,
+        random_seed=random_seed,
+    )
+
+def inject_bit_flip(
+    tensor: torch.Tensor,
+    flat_index: int,
+    bit_position: int,
+    inplace: bool = False,
+    *,
+    tensor_name: str | None = None,
+    step: int | None = None,
+    random_seed: int | None = None,
+    parameter_version: int | str | None = None,
+    injection_phase: str | None = None,
+    synchronize: bool = False,
+) -> InjectionResult:
+    """Flip one IEEE-754 bit of one logical tensor element.
+
+    Parameters
+    ----------
+    tensor:
+        FP16, BF16, or FP32 tensor on CPU or CUDA.
+    flat_index:
+        Non-negative row-major logical element index, as produced by
+        ``tensor.flatten()[index]``.
+    bit_position:
+        ``0`` is the LSB; the dtype's MSB is the sign bit.
+    inplace:
+        If ``False``, operate on a clone and leave ``tensor`` unchanged.  If
+        ``True``, mutate the original storage, including for slices and other
+        non-contiguous views.
+
+    Returns
+    -------
+    InjectionResult
+        The affected tensor plus exact original/corrupted values and bit
+        patterns.  The target bit is always verified after mutation.
+    """
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"tensor must be a torch.Tensor, got {type(tensor)!r}")
+    fmt = get_float_format(tensor)
+    _validate_flat_index(tensor, flat_index)
+    _validate_bit_position(fmt, bit_position)
+    work = tensor if inplace else tensor.clone()
+    return _inject_one(
+        work,
+        BitFlipSpec(flat_index=flat_index, bit_position=bit_position),
+        inplace=inplace,
+        tensor_name=tensor_name,
+        step=step,
+        random_seed=random_seed,
+        synchronize=synchronize,
+        parameter_version=parameter_version,
+        injection_phase=injection_phase,
+    )
+def inject_bit_flips(
+    tensor: torch.Tensor,
+    specs: Sequence[BitFlipSpec | tuple[int, int]],
+    inplace: bool = False,
+    *,
+    tensor_name: str | None = None,
+    step: int | None = None,
+    random_seed: int | None = None,
+    parameter_version: int | str | None = None,
+    injection_phase: str | None = None,
+    synchronize: bool = False,
+) -> list[InjectionResult]:
+    """Apply multiple independently recorded bit flips to one tensor.
+
+    All injections share one working tensor.  With ``inplace=False`` the
+    returned results reference the same combined clone.  Every specification
+    is validated before mutation, and every event is verified separately.
+    """
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"tensor must be a torch.Tensor, got {type(tensor)!r}")
+    fmt = get_float_format(tensor)
+    normalized: list[BitFlipSpec] = []
+    for item in specs:
+        if isinstance(item, BitFlipSpec):
+            spec = item
+        else:
+            try:
+                flat_index, bit_position = item
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "Each specification must be BitFlipSpec or (flat_index, bit_position)"
+                ) from exc
+            spec = BitFlipSpec(int(flat_index), int(bit_position))
+        _validate_flat_index(tensor, spec.flat_index)
+        _validate_bit_position(fmt, spec.bit_position)
+        normalized.append(spec)
+
+    if not normalized:
+        return []
+
+    work = tensor if inplace else tensor.clone()
+    return [
+        _inject_one(
+            work,
+            spec,
+            inplace=inplace,
+            tensor_name=tensor_name,
+            step=step,
+            random_seed=random_seed,
+            synchronize=synchronize,
+            parameter_version=parameter_version,
+            injection_phase=injection_phase,
+        )
+        for spec in normalized
+    ]
+
+
+def plan_random_injections(
+    tensor: torch.Tensor,
+    count: int = 1,
+    seed: int | None = None,
+    bit_type: BitType | str | None = None,
+) -> list[BitFlipSpec]:
+    """Create a reproducible random fault plan without touching the tensor.
+
+    One logical element is selected at most once.  The RNG is local and no
+    Python/PyTorch global random state is read or modified.
+    """
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"tensor must be a torch.Tensor, got {type(tensor)!r}")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError(f"count must be a non-negative integer, got {count!r}")
+    if count > tensor.numel():
+        raise ValueError(
+            f"Cannot select {count} unique elements from a tensor with numel={tensor.numel()}"
+        )
+    if count == 0:
+        return []
+
+    fmt = get_float_format(tensor)
+    positions = (
+        tuple(range(fmt.total_bits))
+        if bit_type is None
+        else fmt.bit_positions(coerce_bit_type(bit_type))
+    )
+    rng = random.Random(seed)
+    flat_indices = rng.sample(range(tensor.numel()), count)
+    return [
+        BitFlipSpec(flat_index=int(index), bit_position=int(rng.choice(positions)))
+        for index in flat_indices
+    ]
+
+
+def inject_random_bit_flips(
+    tensor: torch.Tensor,
+    count: int = 1,
+    seed: int | None = None,
+    bit_type: BitType | str | None = None,
+    inplace: bool = False,
+    *,
+    tensor_name: str | None = None,
+    step: int | None = None,
+    parameter_version: int | str | None = None,
+    injection_phase: str | None = None,
+    synchronize: bool = False,
+) -> list[InjectionResult]:
+    """Plan and apply deterministic random bit flips to distinct elements."""
+
+    specs = plan_random_injections(tensor, count=count, seed=seed, bit_type=bit_type)
+    return inject_bit_flips(
+        tensor,
+        specs,
+        inplace=inplace,
+        tensor_name=tensor_name,
+        step=step,
+        random_seed=seed,
+        synchronize=synchronize,
+        parameter_version=parameter_version,
+        injection_phase=injection_phase,
+    )
